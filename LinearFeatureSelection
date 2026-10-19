@@ -1,0 +1,62 @@
+"""Shared statement selection for the locally implemented PCA/LDA baselines."""
+import math
+
+import numpy as np
+import pandas as pd
+
+from ProcessedData import ProcessedData
+
+
+LDA_RIDGE_FACTOR = 1e-3
+SELECTION_POLICY = {
+    "version": "linear_statement_selection_v1",
+    "input": "unscaled_binary_coverage_all_test_rows",
+    "selection": "max(1, floor(statements * cp)); descending score; original-order ties",
+    "pca": "centered PCA; ep cumulative variance; sum(eigenvalue * squared loading)",
+    "pca_boundary": "include all components tied at the retained eigenvalue boundary",
+    "lda": "abs(solve(pooled_within_class_covariance + ridge * I, failing_mean - passing_mean))",
+    "lda_ridge": "max(1e-3 * mean(within_class_variance), 1e-12)",
+    "excluded_statements": "restore at zero suspiciousness; retain original fault annotations",
+}
+
+
+class LinearFeatureSelection(ProcessedData):
+    def _coverage(self, components_percent):
+        if not 0 < components_percent <= 1:
+            raise ValueError("-cp must be in (0, 1]")
+        if not self.feature_df.index.equals(self.label_df.index):
+            raise ValueError("Coverage and test labels must have matching row indices")
+        if len(self.feature_df) < 2 or self.feature_df.shape[1] == 0:
+            raise ValueError("PCA/LDA requires at least two tests and one statement")
+        values = np.array(self.feature_df, dtype=np.float64, copy=True)
+        if not np.isin(values, [0, 1]).all():
+            raise ValueError("PCA/LDA requires binary statement coverage")
+        if "error" not in self.label_df or self.label_df.shape[1] != 1:
+            raise ValueError("PCA/LDA requires a single 'error' label column")
+        labels = np.asarray(self.label_df["error"])
+        if not np.isin(labels, [0, 1]).all():
+            raise ValueError("Test labels must be binary (0=passing, 1=failing)")
+        return values, labels
+
+    def _select(self, scores, components_percent, algorithm, metadata):
+        if not np.isfinite(scores).all():
+            raise ValueError("{} selection produced non-finite scores".format(algorithm))
+        columns = self.feature_df.columns
+        count = max(1, math.floor(len(columns) * components_percent))
+        # Stable sorting gives identical-score statements their original order.
+        chosen = np.argsort(-scores, kind="stable")[:count]
+        selected = np.zeros(len(columns), dtype=bool)
+        selected[chosen] = True
+        self.selection_components = pd.DataFrame({
+            "line_num": columns, "selection_score": scores, "selected": selected,
+        })
+        self.cp = float(components_percent)
+        self.selection_metadata = dict(metadata, algorithm=algorithm, cp=self.cp,
+                                       tests=len(self.feature_df),
+                                       original_statements=len(columns), selected_statements=count)
+        self.rest_columns = list(dict.fromkeys(
+            self.rest_columns + columns[~selected].tolist()))
+        self.feature_df = self.feature_df.loc[:, selected].copy()
+        self.data_df = pd.concat([self.feature_df, self.label_df], axis=1)
+        print("{} selection: {}/{} statements; all {} test rows retained".format(
+            algorithm.upper(), count, len(columns), len(self.label_df)))
